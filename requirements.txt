@@ -1,0 +1,10 @@
+# PostRadar v0.1 runtime dependencies
+
+aiogram>=3.31,<4
+Telethon>=1.45,<2
+SQLAlchemy[asyncio]>=2.1,<3
+aiosqlite>=0.21,<1
+pydantic-settings>=2.15,<3
+httpx>=0.28,<1
+tenacity>=9.1,<10
+google-genai>=1.0.0,<2

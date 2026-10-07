@@ -1,0 +1,59 @@
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+
+# Python bytecode, test and tool caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+build/
+dist/
+wheels/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# SQLite databases and runtime sidecars
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Telethon authorization sessions and backups
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+*.session.*
+*.session-*
+
+# Runtime data (database, downloaded media, sessions)
+/data/*
+!/data/.gitkeep
+
+# Runtime logs
+*.log
+logs/
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
