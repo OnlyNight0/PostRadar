@@ -9,6 +9,7 @@ from postradar.config import Settings
 from postradar.db.session import create_session_factory, init_db
 from postradar.logging import configure_logging
 from postradar.services.ai_editor import AIEditor
+from postradar.services.network_diagnostic import run_network_diagnostic
 from postradar.telegram.source_client import SourceMonitor, validate_telegram_settings
 
 
@@ -52,6 +53,7 @@ async def main() -> None:
         logger.info(
             "Open the PostRadar bot in Telegram and press Start once before expecting admin previews"
         )
+        run_network_diagnostic()
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(monitor.run(), name="telethon-source-monitor")
             tasks.create_task(
