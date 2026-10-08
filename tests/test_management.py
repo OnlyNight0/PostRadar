@@ -27,6 +27,7 @@ class FakeSourceMonitor:
     def __init__(self) -> None:
         self.resolve_source = AsyncMock()
         self.refresh_enabled_sources = AsyncMock(return_value=1)
+        self.protection_for_source = AsyncMock(return_value=False)
 
 
 class FakeBot:
@@ -203,7 +204,7 @@ class ManagementAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         monitor = FakeSourceMonitor()
         bot = FakeBot()
         management = ManagementService(factory, bot, monitor)
-        workflow = AdminWorkflow(bot, factory, 12345)
+        workflow = AdminWorkflow(bot, factory, 12345, source_monitor=monitor)
         router = create_management_router(management, workflow, 12345)
         callback = SimpleNamespace(
             from_user=SimpleNamespace(id=54321),

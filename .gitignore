@@ -30,11 +30,11 @@ ENV/
 
 # SQLite databases and runtime sidecars
 *.db
-*.db-wal
-*.db-shm
-*.db-journal
+*.db-*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 
 # Telethon authorization sessions and backups
 *.session

@@ -1,4 +1,4 @@
-"""Deterministic, conservative cleanup for source-specific Telegram clutter."""
+"""Legacy semantic sanitizer; new capture uses technical telegram_markup only."""
 
 import re
 from collections.abc import Mapping, Sequence

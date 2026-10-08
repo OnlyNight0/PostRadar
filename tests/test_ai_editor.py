@@ -1,12 +1,19 @@
 """Tests for primary/fallback Gemini editing without network access."""
 
 import unittest
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from google.genai.errors import ClientError, ServerError
 
-from postradar.services.ai_editor import AIEditor
+from pydantic import ValidationError
+
+from postradar.services.ai_editor import (
+    AIEditor,
+    ProcessingResponse,
+    ProviderProcessingResponse,
+)
 
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-3.8-flash"
@@ -32,6 +39,94 @@ def provider_error(error_type: type[Exception], status_code: int, message: str) 
 
 
 class AIEditorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_schema_omits_additional_properties_and_is_used(self) -> None:
+        generate = AsyncMock(return_value=SimpleNamespace(text=json.dumps({
+            "content_type": "CONTENT", "reason": "Useful information",
+            "edited_html": "Edited text",
+        })))
+        editor = AIEditor(api_key="test-key", client=fake_client(generate))
+
+        result = await editor.process("Source text")
+
+        self.assertEqual(result.content_type, "CONTENT")
+        config = generate.await_args.kwargs["config"]
+        self.assertIs(config.response_schema, ProviderProcessingResponse)
+        self.assertNotIn("additionalProperties", ProviderProcessingResponse.model_json_schema())
+        self.assertNotIn("additionalProperties", config.response_schema.model_json_schema())
+
+    def test_local_processing_response_rejects_unexpected_or_invalid_fields(self) -> None:
+        valid = {
+            "content_type": "CONTENT",
+            "reason": "Useful information",
+            "edited_html": "Edited text",
+        }
+        invalid_results = (
+            {**valid, "unexpected": True},
+            {**valid, "reason": ""},
+            {**valid, "reason": "x" * 301},
+            {**valid, "content_type": "PROMOTED"},
+        )
+        for response in invalid_results:
+            with self.subTest(response=response):
+                with self.assertRaises(ValidationError):
+                    ProcessingResponse.model_validate(response)
+
+    def test_provider_response_is_still_revalidated_by_strict_local_model(self) -> None:
+        provider_payload = {
+            "content_type": "CONTENT",
+            "reason": "Useful information",
+            "edited_html": "Edited text",
+            "unexpected": "provider returned an extra field",
+        }
+        with self.assertRaises(ValidationError):
+            ProcessingResponse.model_validate_json(json.dumps(provider_payload))
+
+    async def test_valid_structured_response_is_accepted(self) -> None:
+        payload = {
+            "content_type": "CONTENT",
+            "reason": "Event details are useful",
+            "edited_html": "Tickets cost 500 ₽",
+        }
+        generate = AsyncMock(return_value=SimpleNamespace(text=json.dumps(payload)))
+        editor = AIEditor(api_key="test-key", client=fake_client(generate))
+
+        result = await editor.process("Tickets cost 500 ₽")
+
+        self.assertEqual(result.content_type, "CONTENT")
+        self.assertEqual(result.reason, payload["reason"])
+        self.assertEqual(result.edited_html, payload["edited_html"])
+        generate.assert_awaited_once()
+
+    async def test_http_400_is_permanent_and_uses_safe_fallback(self) -> None:
+        generate = AsyncMock(side_effect=provider_error(ClientError, 400, "Invalid schema"))
+        editor = AIEditor(api_key="test-key", client=fake_client(generate))
+
+        result = await editor.process("<b>Source text</b>")
+
+        self.assertEqual(result.content_type, "UNCERTAIN")
+        self.assertEqual(result.edited_html, "<b>Source text</b>")
+        generate.assert_awaited_once()
+        self.assertEqual(generate.await_args.kwargs["model"], PRIMARY_MODEL)
+
+    async def test_http_504_tries_fallback_model(self) -> None:
+        generate = AsyncMock(side_effect=[
+            provider_error(ServerError, 504, "Deadline expired"),
+            SimpleNamespace(text=json.dumps({
+                "content_type": "CONTENT", "reason": "Fallback succeeded",
+                "edited_html": "Source text",
+            })),
+        ])
+        editor = AIEditor(api_key="test-key", client=fake_client(generate))
+
+        result = await editor.process("Source text")
+
+        self.assertEqual(result.content_type, "CONTENT")
+        self.assertEqual(result.reason, "Fallback succeeded")
+        self.assertEqual(
+            [call.kwargs["model"] for call in generate.await_args_list],
+            [PRIMARY_MODEL, FALLBACK_MODEL],
+        )
+
     async def test_primary_success_skips_fallback(self) -> None:
         generate = AsyncMock(return_value=SimpleNamespace(text="Edited Russian text"))
         editor = AIEditor(api_key="test-key", client=fake_client(generate))

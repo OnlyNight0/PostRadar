@@ -14,11 +14,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from postradar.db.base import Base
 from postradar.db.models import Category, Source, SourcePost, SourcePostMedia
-from postradar.services.ai_editor import AIEditor
+from postradar.services.ai_editor import AIEditor, ProcessingResult
 from postradar.telegram.source_client import (
     SourceMonitor,
     SourceResolutionError,
     detect_media_type,
+    content_protection_state,
     load_enabled_sources,
     persist_message,
     persist_album,
@@ -30,6 +31,10 @@ from postradar.telegram.source_client import (
 
 class SourceClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        no_sessions = patch("postradar.telegram.source_client.TelegramClient",
+                            side_effect=AssertionError("Offline tests must inject a fake client"))
+        no_sessions.start()
+        self.addCleanup(no_sessions.stop)
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
@@ -70,8 +75,13 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             media=object(),
             photo=object(),
         )
-        self.assertTrue(await persist_message(self.factory, source, message))
-        self.assertFalse(await persist_message(self.factory, source, message))
+        async def download(message, file):
+            Path(file).write_bytes(b"fake media")
+            return file
+        client = SimpleNamespace(download_media=AsyncMock(side_effect=download))
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertTrue(await persist_message(self.factory, source, message, client, directory))
+            self.assertFalse(await persist_message(self.factory, source, message, client, directory))
         async with self.factory() as session:
             count = await session.scalar(select(func.count()).select_from(SourcePost))
             saved = await session.scalar(select(SourcePost))
@@ -81,7 +91,7 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved.edited_text, "caption text")
         self.assertEqual(saved.media_type, "photo")
 
-    async def test_sanitized_text_is_persisted_without_changing_original(self) -> None:
+    async def test_complete_text_is_persisted_without_semantic_sanitization(self) -> None:
         original = (
             "Useful news text.\n\n"
             "Подписывайся: @example_channel\n"
@@ -102,7 +112,7 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
         async with self.factory() as session:
             saved = await session.scalar(select(SourcePost))
         self.assertEqual(saved.original_text, original)
-        self.assertEqual(saved.sanitized_text, "Useful news text.")
+        self.assertEqual(saved.sanitized_text, original)
 
     async def test_source_post_keeps_category_snapshot_after_source_is_reassigned(self) -> None:
         async with self.factory() as session:
@@ -170,7 +180,7 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
                     return file
 
             client = FakeMediaClient()
-            editor = SimpleNamespace(edit=AsyncMock(return_value="Edited album caption"))
+            editor = SimpleNamespace(process=AsyncMock(return_value=ProcessingResult("CONTENT", "Standalone content", "Edited album caption")))
             self.assertTrue(
                 await persist_album(
                     self.factory, source, 5522, messages, client, directory, editor
@@ -198,7 +208,7 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(posts[0].edited_text, "Edited album caption")
             self.assertEqual([item.telegram_message_id for item in media_items], [30, 31, 32])
             self.assertEqual([item.position for item in media_items], [0, 1, 2])
-            editor.edit.assert_awaited_once_with("Album caption")
+            editor.process.assert_awaited_once_with("Album caption", category_name=None, source_title=None, source_username=None)
             self.assertEqual(client.download_media.await_count, 3)
 
     async def test_failed_album_item_download_does_not_lose_other_items_or_caption(self) -> None:
@@ -278,6 +288,15 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
                     Path(file).write_bytes(b"media")
                     return file
 
+                async def get_entity(self, chat_id):
+                    return SimpleNamespace(noforwards=False)
+
+                async def get_messages(self, chat, ids):
+                    return [SimpleNamespace(id=identity, noforwards=False) for identity in ids]
+
+                async def disconnect(self):
+                    pass
+
                 def is_connected(self):
                     return False
 
@@ -322,7 +341,12 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             await session.refresh(source)
 
         message = SimpleNamespace(id=13, message=None, date=None, media=object(), photo=object())
-        self.assertTrue(await persist_message(self.factory, source, message))
+        async def download(message, file):
+            Path(file).write_bytes(b"fake media")
+            return file
+        with tempfile.TemporaryDirectory() as directory:
+            client = SimpleNamespace(download_media=AsyncMock(side_effect=download))
+            self.assertTrue(await persist_message(self.factory, source, message, client, directory))
         async with self.factory() as session:
             saved = await session.scalar(select(SourcePost))
         self.assertIsNone(saved.original_text)
@@ -356,20 +380,15 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             saved = await session.scalar(select(SourcePost))
         self.assertIsNone(saved.media_path)
 
-    async def test_sanitizer_failure_falls_back_to_original_and_persists(self) -> None:
+    async def test_capture_does_not_call_legacy_sanitizer(self) -> None:
         async with self.factory() as session:
             source = Source(telegram_chat_id=-100987, username="source", enabled=True)
             session.add(source)
             await session.commit()
-            await session.refresh(source)
-
         message = SimpleNamespace(id=14, message="Original remains", date=None, media=None)
-        with patch(
-            "postradar.telegram.source_client.sanitize_text",
-            side_effect=RuntimeError("sanitizer failure"),
-        ):
-            with self.assertLogs("postradar.telegram.source_client", level="ERROR"):
-                self.assertTrue(await persist_message(self.factory, source, message))
+        with patch("postradar.services.sanitizer.sanitize_text", side_effect=AssertionError("legacy sanitizer must not run")) as sanitize:
+            self.assertTrue(await persist_message(self.factory, source, message))
+        sanitize.assert_not_called()
         async with self.factory() as session:
             saved = await session.scalar(select(SourcePost))
         self.assertEqual(saved.original_text, "Original remains")
@@ -410,14 +429,16 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             async with self.factory() as session:
                 saved = await session.scalar(select(SourcePost))
 
-            expected_path = Path(media_directory) / str(source.id) / "25_photo.jpg"
+            expected_path = Path(saved.media_path)
+            self.assertEqual(expected_path.parent, Path(media_directory) / str(source.id))
+            self.assertIn("capture-", expected_path.name)
             self.assertTrue(inserted)
             self.assertFalse(duplicate)
             self.assertEqual(client.download_count, 1)
             self.assertEqual(saved.media_path, str(expected_path))
             self.assertEqual(expected_path.read_bytes(), b"fake photo")
 
-    async def test_media_download_failure_does_not_prevent_post_persistence(self) -> None:
+    async def test_media_download_failure_preserves_receipt_without_partial_candidate(self) -> None:
         async with self.factory() as session:
             source = Source(telegram_chat_id=-100357, username="video_source", enabled=True)
             session.add(source)
@@ -449,9 +470,11 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             async with self.factory() as session:
                 saved = await session.scalar(select(SourcePost))
 
-        self.assertTrue(inserted)
+        self.assertFalse(inserted)
         self.assertIsNone(saved.media_path)
-        self.assertEqual(saved.original_text, "Video caption")
+        self.assertIsNone(saved.original_text)
+        self.assertEqual(saved.status, "CAPTURE_PENDING")
+        self.assertIsNotNone(saved.capture_next_attempt_at)
 
     async def test_ai_edit_is_persisted_without_changing_text_stages_or_reediting_duplicate(self) -> None:
         original = "OpenAI added a feature.\n\nПодписывайся: @example_channel"
@@ -461,7 +484,7 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
             await session.refresh(source)
 
-        create = AsyncMock(return_value=SimpleNamespace(text="OpenAI introduced a feature."))
+        create = AsyncMock(return_value=SimpleNamespace(text=' {"content_type":"CONTENT","reason":"News","edited_html":"OpenAI introduced a feature."} '))
         ai_editor = AIEditor(
             api_key="test-key",
             client=SimpleNamespace(
@@ -477,7 +500,7 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
         async with self.factory() as session:
             saved = await session.scalar(select(SourcePost))
         self.assertEqual(saved.original_text, original)
-        self.assertEqual(saved.sanitized_text, "OpenAI added a feature.")
+        self.assertEqual(saved.sanitized_text, original)
         self.assertEqual(saved.edited_text, "OpenAI introduced a feature.")
 
     async def test_missing_api_key_fallback_still_persists_post(self) -> None:
@@ -531,7 +554,15 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
         edit = AsyncMock(side_effect=AssertionError("media-only post must skip AI editing"))
         editor = SimpleNamespace(edit=edit)
         message = SimpleNamespace(id=32, message=None, date=None, media=object(), photo=object())
-        self.assertTrue(await persist_message(self.factory, source, message, ai_editor=editor))
+        async def download(message, file):
+            Path(file).write_bytes(b"fake media")
+            return file
+        client = SimpleNamespace(download_media=AsyncMock(side_effect=download))
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertTrue(await persist_message(
+                self.factory, source, message, media_client=client,
+                media_dir=directory, ai_editor=editor,
+            ))
         edit.assert_not_awaited()
         async with self.factory() as session:
             saved = await session.scalar(select(SourcePost))
@@ -569,6 +600,402 @@ class SourceClientTests(unittest.IsolatedAsyncioTestCase):
                 return user
 
         self.assertIs(await require_user_account(FakeClient()), user)
+
+    async def _protection_source(self) -> Source:
+        async with self.factory() as session:
+            source = Source(telegram_chat_id=-100909, enabled=True)
+            session.add(source)
+            await session.commit()
+            await session.refresh(source)
+            return source
+
+    async def test_protection_state_checks_chat_and_message_and_fails_closed(self) -> None:
+        unprotected_chat = SimpleNamespace(noforwards=False)
+        self.assertFalse(content_protection_state(unprotected_chat, SimpleNamespace(noforwards=False)))
+        self.assertTrue(content_protection_state(
+            SimpleNamespace(noforwards=True), SimpleNamespace(noforwards=False)
+        ))
+        self.assertTrue(content_protection_state(
+            unprotected_chat, SimpleNamespace(noforwards=True)
+        ))
+        self.assertIsNone(content_protection_state(None, SimpleNamespace(noforwards=False)))
+        self.assertIsNone(content_protection_state(unprotected_chat, SimpleNamespace()))
+
+    async def test_publish_guard_checks_protection_on_original_messages(self) -> None:
+        chat = SimpleNamespace(noforwards=False)
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=chat),
+            get_messages=AsyncMock(return_value=[
+                SimpleNamespace(id=10, noforwards=False),
+                SimpleNamespace(id=11, noforwards=True),
+            ]),
+        )
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client)
+
+        self.assertTrue(await monitor.protection_for_source(-100100, [10, 11]))
+        client.get_messages.assert_awaited_once_with(chat, ids=[10, 11])
+
+    async def test_publish_guard_fails_closed_when_original_protection_cannot_be_read(self) -> None:
+        chat = SimpleNamespace(noforwards=False)
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=chat),
+            get_messages=AsyncMock(return_value=[SimpleNamespace(id=10, noforwards=None)]),
+        )
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client)
+
+        self.assertIsNone(await monitor.protection_for_source(-100100, [10]))
+
+    async def test_protected_channel_message_is_marked_without_ai_or_media_access(self) -> None:
+        source = await self._protection_source()
+        editor = SimpleNamespace(process=AsyncMock())
+        client = SimpleNamespace(download_media=AsyncMock(), is_connected=lambda: False)
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+        message = SimpleNamespace(
+            id=901, message="protected text", noforwards=False, grouped_id=None,
+            media=object(), photo=object(),
+        )
+
+        await monitor._handle_source_message(
+            source, message, SimpleNamespace(noforwards=True)
+        )
+
+        async with self.factory() as session:
+            saved = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 901))
+        self.assertEqual(saved.status, "PROTECTED")
+        self.assertIsNone(saved.original_text)
+        self.assertIsNone(saved.source_html)
+        self.assertIsNone(saved.media_path)
+        editor.process.assert_not_awaited()
+        client.download_media.assert_not_awaited()
+
+    async def test_individually_protected_message_is_not_copied(self) -> None:
+        source = await self._protection_source()
+        editor = SimpleNamespace(process=AsyncMock())
+        client = SimpleNamespace(download_media=AsyncMock(), is_connected=lambda: False)
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+        message = SimpleNamespace(
+            id=902, message="protected caption", noforwards=True, grouped_id=None,
+            media=object(), photo=object(),
+        )
+
+        await monitor._handle_source_message(
+            source, message, SimpleNamespace(noforwards=False)
+        )
+
+        async with self.factory() as session:
+            saved = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 902))
+        self.assertEqual(saved.status, "PROTECTED")
+        self.assertIsNone(saved.original_text)
+        editor.process.assert_not_awaited()
+        client.download_media.assert_not_awaited()
+
+    async def test_protected_album_discards_buffer_and_never_processes_fragments(self) -> None:
+        source = await self._protection_source()
+        editor = SimpleNamespace(process=AsyncMock())
+        client = SimpleNamespace(download_media=AsyncMock(), is_connected=lambda: False)
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+        chat = SimpleNamespace(noforwards=False)
+        first = SimpleNamespace(
+            id=910, grouped_id=99, message="caption", noforwards=False,
+            media=object(), photo=object(),
+        )
+        protected = SimpleNamespace(
+            id=911, grouped_id=99, message="secret fragment", noforwards=True,
+            media=object(), photo=object(),
+        )
+
+        await monitor._handle_source_message(source, first, chat)
+        self.assertIn((source.id, 99), monitor._album_batches)
+        await monitor._handle_source_message(source, protected, chat)
+
+        async with self.factory() as session:
+            saved = await session.scalar(select(SourcePost).where(SourcePost.grouped_id == 99))
+        self.assertEqual(saved.status, "PROTECTED")
+        self.assertIsNone(saved.original_text)
+        self.assertEqual(monitor._album_batches, {})
+        editor.process.assert_not_awaited()
+        client.download_media.assert_not_awaited()
+
+    async def test_unavailable_protection_metadata_skips_without_logging_content(self) -> None:
+        source = await self._protection_source()
+        editor = SimpleNamespace(process=AsyncMock())
+        client = SimpleNamespace(download_media=AsyncMock(), is_connected=lambda: False)
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+        message = SimpleNamespace(
+            id=903, message="private body that must not be logged", grouped_id=None,
+            media=None,
+        )
+
+        with self.assertLogs("postradar.telegram.source_client", level="INFO") as logs:
+            await monitor._handle_source_message(source, message, None)
+
+        async with self.factory() as session:
+            saved = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 903))
+        self.assertEqual(saved.status, "PROTECTION_CAPTURE_PENDING")
+        self.assertIsNone(saved.original_text)
+        self.assertNotIn("private body", " ".join(logs.output))
+        editor.process.assert_not_awaited()
+        client.download_media.assert_not_awaited()
+
+    async def _create_capture_marker(
+        self, message_id: int, *, grouped_id: int | None = None, enabled: bool = True
+    ) -> Source:
+        async with self.factory() as session:
+            source = Source(telegram_chat_id=-100000 - message_id, enabled=enabled)
+            session.add(source)
+            await session.commit()
+            await session.refresh(source)
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=SimpleNamespace())
+        message = SimpleNamespace(
+            id=message_id, grouped_id=grouped_id, message="private incoming text",
+            media=None, noforwards=None,
+        )
+        await monitor._handle_source_message(source, message, None)
+        return source
+
+    async def test_pending_capture_recovers_in_place_after_protection_clears(self) -> None:
+        source = await self._create_capture_marker(920)
+        message = SimpleNamespace(
+            id=920, grouped_id=None, message="Recovered source", date=None,
+            media=None, noforwards=False, entities=[],
+        )
+        editor = SimpleNamespace(process=AsyncMock(return_value=ProcessingResult(
+            "CONTENT", "Recovered safely", "<p>Recovered safely</p>"
+        )))
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=message),
+        )
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+        async with self.factory() as session:
+            marker = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 920))
+            marker_id = marker.id
+
+        self.assertEqual(await monitor.recover_pending_captures(), 1)
+        async with self.factory() as session:
+            recovered = await session.get(SourcePost, marker_id)
+            count = await session.scalar(select(func.count()).select_from(SourcePost))
+        self.assertEqual(count, 1)
+        self.assertEqual(recovered.id, marker_id)
+        self.assertEqual(recovered.status, "NEW")
+        self.assertEqual(recovered.original_text, "Recovered source")
+        editor.process.assert_awaited_once()
+        self.assertEqual(await monitor.recover_pending_captures(), 0)
+        editor.process.assert_awaited_once()
+
+    async def test_pending_capture_keeps_retrying_when_protection_is_unknown(self) -> None:
+        await self._create_capture_marker(921)
+        message = SimpleNamespace(id=921, noforwards=None)
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=message),
+        )
+        editor = SimpleNamespace(process=AsyncMock())
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+
+        self.assertEqual(await monitor.recover_pending_captures(), 0)
+        async with self.factory() as session:
+            marker = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 921))
+        self.assertEqual(marker.status, "PROTECTION_CAPTURE_PENDING")
+        self.assertIsNone(marker.original_text)
+        editor.process.assert_not_awaited()
+
+    async def test_pending_capture_confirmed_protected_is_scrubbed_and_never_processed(self) -> None:
+        await self._create_capture_marker(922)
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=True)),
+            get_messages=AsyncMock(),
+        )
+        editor = SimpleNamespace(process=AsyncMock())
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+
+        self.assertEqual(await monitor.recover_pending_captures(), 0)
+        async with self.factory() as session:
+            marker = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 922))
+        self.assertEqual(marker.status, "PROTECTED")
+        self.assertIsNone(marker.original_text)
+        client.get_messages.assert_not_awaited()
+        editor.process.assert_not_awaited()
+
+    async def test_historical_unverified_row_is_never_reactivated(self) -> None:
+        source = await self._protection_source()
+        async with self.factory() as session:
+            session.add(SourcePost(
+                source_id=source.id, telegram_message_id=923,
+                status="PROTECTION_UNVERIFIED", original_text=None, edited_text=None,
+            ))
+            await session.commit()
+        client = SimpleNamespace(get_entity=AsyncMock(), get_messages=AsyncMock())
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client)
+
+        self.assertEqual(await monitor.recover_pending_captures(), 0)
+        client.get_entity.assert_not_awaited()
+        async with self.factory() as session:
+            saved = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 923))
+        self.assertEqual(saved.status, "PROTECTION_UNVERIFIED")
+
+    async def test_pending_marker_survives_restart_and_retries_after_fetch_failure(self) -> None:
+        await self._create_capture_marker(924)
+        failed_client = SimpleNamespace(get_entity=AsyncMock(side_effect=RuntimeError("offline")))
+        first_monitor = SourceMonitor(1, "hash", "session", self.factory, client=failed_client)
+        with self.assertLogs("postradar.telegram.source_client", level="WARNING"):
+            self.assertEqual(await first_monitor.recover_pending_captures(), 0)
+
+        message = SimpleNamespace(
+            id=924, grouped_id=None, message="Recovered after restart", date=None,
+            media=None, noforwards=False, entities=[],
+        )
+        editor = SimpleNamespace(process=AsyncMock(return_value=ProcessingResult(
+            "CONTENT", "Recovered", "<p>Recovered</p>"
+        )))
+        second_monitor = SourceMonitor(1, "hash", "session", self.factory, client=SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=message),
+        ), ai_editor=editor)
+        self.assertEqual(await second_monitor.recover_pending_captures(), 1)
+        editor.process.assert_awaited_once()
+
+    async def test_concurrent_recovery_attempts_do_not_duplicate_processing(self) -> None:
+        await self._create_capture_marker(925)
+        message = SimpleNamespace(
+            id=925, grouped_id=None, message="Recovered once", date=None,
+            media=None, noforwards=False, entities=[],
+        )
+        async def process(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            return ProcessingResult("CONTENT", "Recovered", "<p>Recovered</p>")
+        editor = SimpleNamespace(process=AsyncMock(side_effect=process))
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=message),
+        )
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+
+        await asyncio.gather(
+            monitor.recover_pending_captures(), monitor.recover_pending_captures()
+        )
+        editor.process.assert_awaited_once()
+        async with self.factory() as session:
+            count = await session.scalar(select(func.count()).select_from(SourcePost))
+        self.assertEqual(count, 1)
+
+    async def test_disabled_source_and_missing_message_do_not_create_candidates(self) -> None:
+        await self._create_capture_marker(926, enabled=False)
+        await self._create_capture_marker(927)
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=None),
+        )
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client)
+
+        self.assertEqual(await monitor.recover_pending_captures(limit=10), 0)
+        self.assertEqual(client.get_entity.await_count, 1)
+        async with self.factory() as session:
+            missing = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 927))
+            disabled = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 926))
+        self.assertEqual(missing.status, "SKIPPED")
+        self.assertEqual(disabled.status, "PROTECTION_CAPTURE_PENDING")
+
+    async def test_album_pending_marker_is_never_recovered_as_a_single_message(self) -> None:
+        await self._create_capture_marker(928, grouped_id=1234)
+        client = SimpleNamespace(get_entity=AsyncMock(), get_messages=AsyncMock())
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client)
+
+        self.assertEqual(await monitor.recover_pending_captures(), 0)
+        client.get_entity.assert_not_awaited()
+        async with self.factory() as session:
+            marker = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 928))
+        self.assertEqual(marker.status, "PROTECTION_ALBUM_PENDING")
+
+    async def test_missing_recovered_media_keeps_marker_without_partial_candidate(self) -> None:
+        await self._create_capture_marker(929)
+        message = SimpleNamespace(
+            id=929, grouped_id=None, message="caption", date=None,
+            media=object(), photo=object(), noforwards=False, entities=[],
+        )
+        editor = SimpleNamespace(process=AsyncMock(return_value=ProcessingResult(
+            "CONTENT", "Valid", "<p>Valid</p>"
+        )))
+        client = SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=message),
+            download_media=AsyncMock(return_value=None),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = SourceMonitor(
+                1, "hash", "session", self.factory, media_dir=directory,
+                client=client, ai_editor=editor,
+            )
+            with self.assertLogs("postradar.telegram.source_client", level="WARNING"):
+                self.assertEqual(await monitor.recover_pending_captures(), 0)
+
+        async with self.factory() as session:
+            marker = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 929))
+        self.assertEqual(marker.status, "CAPTURE_PENDING")
+        self.assertIsNone(marker.original_text)
+        self.assertIsNone(marker.media_path)
+
+    async def test_unknown_protection_preserves_existing_candidate_and_media(self) -> None:
+        source = await self._protection_source()
+        with tempfile.TemporaryDirectory() as directory:
+            media_path = Path(directory) / "existing.jpg"
+            media_path.write_bytes(b"existing media")
+            async with self.factory() as session:
+                post = SourcePost(
+                    source_id=source.id,
+                    telegram_message_id=905,
+                    status="REVIEW",
+                    original_text="Saved source text",
+                    sanitized_text="Saved sanitized text",
+                    edited_text="Saved edit",
+                    source_html="<p>saved source</p>",
+                    edited_html="<p>saved edit</p>",
+                    media_type="photo",
+                    media_path=str(media_path),
+                )
+                session.add(post)
+                await session.commit()
+
+            monitor = SourceMonitor(1, "hash", "session", self.factory, media_dir=directory, client=SimpleNamespace())
+            message = SimpleNamespace(id=905, grouped_id=None, noforwards=None, media=None)
+            await monitor._handle_source_message(source, message, None)
+
+            async with self.factory() as session:
+                saved = await session.scalar(
+                    select(SourcePost).where(SourcePost.telegram_message_id == 905)
+                )
+            self.assertEqual(saved.status, "REVIEW")
+            self.assertEqual(saved.original_text, "Saved source text")
+            self.assertEqual(saved.sanitized_text, "Saved sanitized text")
+            self.assertEqual(saved.edited_text, "Saved edit")
+            self.assertEqual(saved.source_html, "<p>saved source</p>")
+            self.assertEqual(saved.edited_html, "<p>saved edit</p>")
+            self.assertEqual(saved.media_path, str(media_path))
+            self.assertTrue(media_path.is_file())
+
+    async def test_unprotected_event_still_enters_normal_processing(self) -> None:
+        source = await self._protection_source()
+        message = SimpleNamespace(
+            id=904, message="ordinary source text", noforwards=False, grouped_id=None,
+            date=None, media=None, entities=[],
+        )
+        editor = SimpleNamespace(process=AsyncMock(return_value=ProcessingResult(
+            "CONTENT", "Useful content", "ordinary source text"
+        )))
+        client = SimpleNamespace(download_media=AsyncMock(), is_connected=lambda: False,
+            get_entity=AsyncMock(return_value=SimpleNamespace(noforwards=False)),
+            get_messages=AsyncMock(return_value=message))
+        monitor = SourceMonitor(1, "hash", "session", self.factory, client=client, ai_editor=editor)
+
+        await monitor._handle_source_message(
+            source, message, SimpleNamespace(noforwards=False)
+        )
+
+        async with self.factory() as session:
+            saved = await session.scalar(select(SourcePost).where(SourcePost.telegram_message_id == 904))
+        self.assertEqual(saved.status, "NEW")
+        self.assertEqual(saved.original_text, "ordinary source text")
+        editor.process.assert_awaited_once()
 
     async def test_source_identifier_accepts_username_link_and_numeric_id(self) -> None:
         self.assertEqual(parse_source_identifier("@sample_channel"), "@sample_channel")

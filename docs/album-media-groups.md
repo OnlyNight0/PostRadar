@@ -19,10 +19,17 @@ PYTHONPATH=. ./venv/bin/python main.py
 ```
 
 Album text is selected once from non-empty captions in message-ID order;
-identical captions are included once. Sanitization and Gemini editing run once
-for the resulting candidate. Successfully downloaded photo, video, and document
-items retain their order. A failed item download is logged and does not prevent
-the other items or text from being stored.
+Identical normalized captions are included once; captions with the same visible
+text but different hidden hrefs or formatting remain distinct. Technical entity normalization preserves
+formatting and hidden links; Gemini classifies and edits the combined candidate
+in one structured operation. AD/SELF_PROMO albums remain persisted as FILTERED
+and skip media downloads. Provider/validation failures enter UNCERTAIN review
+with the source markup. See [text processing](text-processing.md). Successfully
+downloaded photo, video, and document items retain their order. A failed item
+download is logged and omitted; the current capture path can therefore persist
+an album candidate with only the media items that were available. The debounce
+window groups observed fragments but cannot prove that Telegram delivered every
+fragment, so this is not a completeness guarantee.
 
 The admin receives one media-group preview followed by one review control
 message. Publishing sends the saved items as one media group, with a caption on

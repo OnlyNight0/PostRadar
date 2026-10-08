@@ -25,6 +25,10 @@ def admin_commands() -> list[BotCommand]:
         BotCommand(command="sources", description="Управление источниками"),
         BotCommand(command="categories", description="Управление категориями"),
         BotCommand(command="cancel", description="Отменить текущее действие"),
+        BotCommand(command="publications", description="Проверить незавершённые отправки"),
+        BotCommand(command="confirm_published", description="Подтвердить пост после проверки канала"),
+        BotCommand(command="captures", description="Проверить незавершённый захват"),
+        BotCommand(command="reviewdeliveries", description="Сверить предпросмотры администратора"),
     ]
 
 
@@ -55,13 +59,17 @@ def create_admin_bot(
     media_dir: str | Path = "./data/media",
 ) -> tuple[Bot, Dispatcher, AdminWorkflow]:
     bot = Bot(token=bot_token)
-    workflow = AdminWorkflow(bot, session_factory, admin_user_id, media_dir=media_dir)
+    workflow = AdminWorkflow(
+        bot, session_factory, admin_user_id, media_dir=media_dir,
+        source_monitor=source_monitor,
+    )
     management = ManagementService(session_factory, bot, source_monitor)
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(create_admin_router(workflow, admin_user_id))
     dispatcher.include_router(create_management_router(management, workflow, admin_user_id))
 
     async def report_startup(**_kwargs: object) -> None:
+        await workflow.publication.recover_expired()
         await register_admin_commands(bot)
         logger.info("PostRadar admin bot started")
 

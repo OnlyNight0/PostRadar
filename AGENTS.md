@@ -5,14 +5,16 @@ PostRadar is an experimental Telegram content-monitoring and publishing assistan
 
 Current stage: **v0.1 MVP / local-first prototype**.
 
-The project currently starts from an almost empty repository with only `main.py`.
+The project has grown beyond its initial single-file prototype. Inspect the
+current implementation before relying on this document for module details.
 
 The immediate goal is NOT to build the final autonomous media system. The goal is to build the smallest reliable vertical slice that can:
 
 1. monitor selected Telegram source channels;
 2. detect new posts;
 3. save source/post metadata locally;
-4. clean obvious source-specific clutter from copied text;
+4. preserve supported Telegram text formatting and links while processing a
+   candidate;
 5. send a candidate post to an admin Telegram bot;
 6. allow a human admin to approve, reject, edit, or publish it;
 7. publish approved content to a configured destination channel.
@@ -21,7 +23,8 @@ The system may later grow into a larger content discovery/editorial engine, but 
 
 ## Current product concept
 
-PostRadar behaves more like a lightweight PosterBot-style source watcher than a full AI editor.
+PostRadar is a local-first source watcher with a structured Gemini processing
+step and human review.
 
 Primary workflow:
 
@@ -30,9 +33,11 @@ Telegram source channels
         ↓
 Telethon client
         ↓
-normalize + sanitize
+protection check + Telegram entity/HTML normalization
         ↓
-SQLite database
+Gemini classification and editing (when configured)
+        ↓
+SQLite database and captured media
         ↓
 admin bot (aiogram)
         ↓
@@ -121,14 +126,17 @@ Possible fields:
 - created_at
 
 ### SourcePost
-A captured original post.
+A captured original post or grouped album. The current model preserves original
+plain text and source HTML separately from edited content; `sanitized_text` is
+a legacy compatibility field, not a semantic sanitizer result for new captures.
 
 Possible fields:
 - id
 - source_id
 - telegram_message_id
 - original_text
-- sanitized_text
+- source_html / edited_html
+- content_type / classification_reason
 - media_type
 - media_reference/path if applicable
 - published_at
@@ -182,37 +190,32 @@ Publishing to destination channels is done with the bot account when the bot has
 
 Do not silently publish content without an explicit human action in v0.1.
 
-## Sanitizer
+## Text processing and AI
 
-The sanitizer is deterministic code, not an LLM.
+New capture technically normalizes Telegram entities into validated HTML while
+preserving original plain text, supported formatting, and safe hidden links.
+Gemini performs one structured classification/editing operation when configured;
+it is not a deterministic sanitizer. Local validation remains authoritative:
+reject malformed or unsafe HTML, unexpected response fields, and introduced URLs.
+On provider or validation failure, retain a safe source-based UNCERTAIN candidate
+for human review. Never publish AI output without the existing explicit admin
+action.
 
-Its purpose is to clean technical/promotional clutter such as:
-- Telegram source links;
-- source `@username` mentions when configured for removal;
-- common subscription CTAs;
-- repeated promotional footer text;
-- excessive blank lines;
-- obvious tracking parameters in URLs where applicable.
+`postradar/services/sanitizer.py` and the old AI `edit()` interface remain for
+compatibility. Do not assume the capture pipeline calls them or use them to
+rewrite new source text. Keep original text and source HTML separate from edited
+content, and do not remove meaningful links or attribution.
 
-Sanitization must be conservative.
+## Media and albums
 
-Do NOT blindly delete arbitrary links from the meaningful body of a post.
-
-Prefer source-specific rules where behavior differs between sources.
-
-The sanitizer must never mutate the stored `original_text`. Store original and sanitized versions separately.
-
-## AI policy for v0.1
-
-Do not add an LLM/API dependency unless the user explicitly asks for it in a later task.
-
-The current MVP should work without AI.
-
-If AI editing is introduced later:
-- keep it as a separate optional service;
-- never make publication depend on an LLM being available;
-- preserve original source material separately;
-- keep deterministic sanitization separate from semantic rewriting.
+Single-message media and albums use the existing capture and review paths.
+Albums are grouped by Telegram `grouped_id`, store ordered media child rows, and
+use an in-memory debounce window. This does not prove Telegram delivered every
+album fragment. Late fragments block the affected candidate; failures to
+download an individual item can leave a candidate with only the other saved
+items. Do not claim complete-album recovery or silently fill missing fragments.
+Respect source- and message-level content protection before downloading,
+processing, previewing, or publishing content.
 
 ## Content and platform constraints
 
@@ -297,6 +300,10 @@ Use migrations only if/when schema evolution becomes non-trivial. Do not introdu
 Use uniqueness constraints for source message identity instead of relying only on application-side checks.
 
 Database operations should be async.
+
+SQLite compatibility initialization validates supported legacy schemas before
+ordinary startup work. See [local operations](docs/local-operations.md) for
+single-instance assumptions and safe database/media backup and restore guidance.
 
 ## Tests
 
@@ -388,13 +395,18 @@ configured source channel
         ↓
 Telethon receives new post
         ↓
-post is persisted once
+protection check and Telegram formatting normalization
         ↓
-text is sanitized
+Gemini classification/editing with local validation
+        ↓
+post is persisted once
         ↓
 admin bot receives candidate
         ↓
 admin chooses what to do
 ```
 
-Prioritize getting this path working cleanly before adding analytics, AI generation, web sources, RSS, scoring, clustering, advanced scheduling, or automatic posting.
+Prioritize reliability of the existing capture, review, and explicit publication
+path before adding analytics, web sources, RSS, scoring, clustering, advanced
+scheduling, or automatic posting. Do not describe Gemini as future work: it is
+already part of the local pipeline when configured.

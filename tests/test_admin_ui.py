@@ -82,7 +82,7 @@ class AdminUiTests(unittest.IsolatedAsyncioTestCase):
         commands = admin_commands()
         self.assertEqual(
             [command.command for command in commands],
-            ["start", "menu", "sources", "categories", "cancel"],
+            ["start", "menu", "sources", "categories", "cancel", "publications", "confirm_published", "captures", "reviewdeliveries"],
         )
         self.assertTrue(all(command.description for command in commands))
         self.assertTrue(all(any(char.isalpha() and ord(char) > 127 for char in command.description) for command in commands))
